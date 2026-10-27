@@ -48,3 +48,4 @@ entry("send");
 entry("recv");
 entry("pgpte");
 entry("kpgtbl");
+entry("ksupercheck");

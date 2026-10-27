@@ -140,3 +140,10 @@ sys_uptime(void)
   release(&tickslock);
   return xticks;
 }
+
+
+uint64
+sys_ksupercheck(void)
+{
+  return ksupercheck_kernel();
+}

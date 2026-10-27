@@ -153,10 +153,113 @@ vmprint(pagetable_t pagetable) {
 // add a mapping to the kernel page table.
 // only used when booting.
 // does not flush TLB or enable paging.
+
+// A level-1 leaf maps 2 MiB.
+#define KSUPERPAGE_SIZE (1UL << 21)
+
+// Return the level-1 PTE corresponding to va.
+// Create the level-1 page-table page when necessary.
+static pte_t *
+kvm_walk_l1(pagetable_t root, uint64 va)
+{
+  if (va >= MAXVA)
+    panic("kvm_walk_l1: va");
+
+  // Select the level-2 entry in the root page table.
+  pte_t *root_entry = &root[PX(2, va)];
+  pagetable_t l1;
+
+  if (*root_entry & PTE_V) {
+    // This implementation does not support an existing 1 GiB leaf.
+    // Never interpret a leaf's physical memory as another page table.
+    if (*root_entry & (PTE_R | PTE_W | PTE_X))
+      panic("kvm_walk_l1: root leaf");
+
+    l1 = (pagetable_t)PTE2PA(*root_entry);
+  } else {
+    l1 = (pagetable_t)kalloc();
+    if (l1 == 0)
+      return 0;
+
+    memset(l1, 0, PGSIZE);
+
+    // A non-leaf entry has V set, without R/W/X.
+    *root_entry = PA2PTE((uint64)l1) | PTE_V;
+  }
+
+  return &l1[PX(1, va)];
+}
+
+// Build kernel mappings using 2 MiB and 4 KiB pages.
+// Inputs must already be 4 KiB aligned.
+static int
+kvm_mappages_mixed(pagetable_t pagetable,
+                  uint64 va, uint64 size,
+                  uint64 pa, int perm)
+{
+  if (size == 0)
+    panic("kvm_mappages_mixed: zero size");
+
+  if ((va % PGSIZE) != 0 ||
+      (pa % PGSIZE) != 0 ||
+      (size % PGSIZE) != 0)
+    panic("kvm_mappages_mixed: alignment");
+
+  // Avoid an invalid virtual range or arithmetic wraparound.
+  if (va >= MAXVA || size > MAXVA - va)
+    panic("kvm_mappages_mixed: va range");
+
+  // Kernel leaf mappings must not be accessible from user mode.
+  if (perm & PTE_U)
+    panic("kvm_mappages_mixed: user mapping");
+
+  // Require a legal leaf permission combination.
+  if ((perm & (PTE_R | PTE_X)) == 0 ||
+      ((perm & PTE_W) && !(perm & PTE_R)))
+    panic("kvm_mappages_mixed: permissions");
+
+  while (size > 0) {
+    pte_t *l1pte = kvm_walk_l1(pagetable, va);
+    if (l1pte == 0)
+      return -1;
+
+    // Any existing level-1 leaf already maps this virtual address.
+    if ((*l1pte & PTE_V) &&
+        (*l1pte & (PTE_R | PTE_W | PTE_X)))
+      panic("kvm_mappages_mixed: remap");
+
+    int use_superpage =
+      (va % KSUPERPAGE_SIZE == 0) &&
+      (pa % KSUPERPAGE_SIZE == 0) &&
+      (size >= KSUPERPAGE_SIZE) &&
+      ((*l1pte & PTE_V) == 0);
+
+    if (use_superpage) {
+      // Install a level-1 leaf directly.
+      *l1pte = PA2PTE(pa) | perm | PTE_V;
+
+      va += KSUPERPAGE_SIZE;
+      pa += KSUPERPAGE_SIZE;
+      size -= KSUPERPAGE_SIZE;
+    } else {
+      // Preserve an existing level-0 table if there is one.
+      // The original mappages() creates/checks the 4 KiB mapping.
+      if (mappages(pagetable, va, PGSIZE, pa, perm) != 0)
+        return -1;
+
+      va += PGSIZE;
+      pa += PGSIZE;
+      size -= PGSIZE;
+    }
+  }
+
+  return 0;
+}
+
 void
 kvmmap(pagetable_t kpgtbl, uint64 va, uint64 pa, uint64 sz, int perm)
 {
-  if(mappages(kpgtbl, va, sz, pa, perm) != 0)
+  if(kvm_mappages_mixed(kpgtbl, va, sz, pa, perm) != 0)
     panic("kvmmap");
 }
 
@@ -529,6 +632,160 @@ ismapped(pagetable_t pagetable, uint64 va) {
   return 0;
 }
 
+// Find a leaf in the actual kernel page table.
+// Unlike an ordinary 4KB-only walk, stop at any leaf level.
+static pte_t
+ksuper_lookup(uint64 va, int *leaf_level)
+{
+  pagetable_t table = kernel_pagetable;
+
+  if (va >= MAXVA)
+    return 0;
+
+  for (int level = 2; level >= 0; level--) {
+    pte_t pte = table[PX(level, va)];
+
+    if ((pte & PTE_V) == 0)
+      return 0;
+
+    if (pte & (PTE_R | PTE_W | PTE_X)) {
+      *leaf_level = level;
+      return pte;
+    }
+
+    if (level == 0)
+      return 0;
+
+    table = (pagetable_t)PTE2PA(pte);
+  }
+
+  return 0;
+}
+
+// Check mapping size, physical address and R/W/X/U permissions.
+// Return 0 on success, -1 on failure.
+static int
+ksuper_check_one(uint64 va, uint64 expected_pa,
+                 int expected_level, int expected_perm)
+{
+  int level = -1;
+  pte_t pte = ksuper_lookup(va, &level);
+
+  if (pte == 0) {
+    printf("FAIL: unmapped va=%p\n", (void *)va);
+    return -1;
+  }
+
+  uint64 size = 1UL << (12 + 9 * level);
+  uint64 pa_base = PTE2PA(pte);
+  uint64 pa = pa_base + (va & (size - 1));
+  int perm = pte & (PTE_R | PTE_W | PTE_X | PTE_U);
+
+  if (level != expected_level ||
+      (pa_base & (size - 1)) != 0 ||
+      pa != expected_pa ||
+      perm != expected_perm) {
+    printf("FAIL: va=%p level=%d expected_level=%d\n",
+           (void *)va, level, expected_level);
+    printf("      pa=%p expected_pa=%p\n", (void *)pa, (void *)expected_pa);
+    printf("      perm=%x expected_perm=%x\n",
+           (uint)perm, (uint)expected_perm);
+    return -1;
+  }
+
+  return 0;
+}
+
+// Check every 4KB position in one direct-mapped, uniform-permission
+// RAM range. Complete aligned 2MB blocks must be level-1 leaves.
+static int
+ksuper_check_range(uint64 start, uint64 end, int perm,
+                   int *small_count, int *super_count)
+{
+  uint64 big = 1UL << 21;
+
+  for (uint64 va = start; va < end; va += PGSIZE) {
+    uint64 block = va & ~(big - 1);
+
+    // Does this entire 2MB block lie inside the current region?
+    int expected_level =
+      (block >= start && end - block >= big) ? 1 : 0;
+
+    if (ksuper_check_one(va, va, expected_level, perm) < 0)
+      return -1;
+
+    if (expected_level == 0) {
+      (*small_count)++;
+    } else if (va == block) {
+      // Count one 2MB mapping once, not once per 4KB position.
+      (*super_count)++;
+
+      if (*super_count <= 3) {
+        printf("2MB sample: va=%p pa=%p perm=%x\n",
+               (void *)va, (void *)va, (uint)perm);
+      }
+    }
+  }
+
+  return 0;
+}
+
+// Entry called by the new system call.
+int
+ksupercheck_kernel(void)
+{
+  int small_count = 0;
+  int super_count = 0;
+
+  printf("\n=== Kernel superpage test ===\n");
+
+  // Kernel text must be readable/executable, but not writable or user.
+  if (ksuper_check_range(KERNBASE, (uint64)etext,
+                         PTE_R | PTE_X,
+                         &small_count, &super_count) < 0)
+    return -1;
+
+  printf("[PASS] kernel text: PA, page size, R-X permissions\n");
+
+  // Kernel data and remaining RAM must be readable/writable.
+  if (ksuper_check_range((uint64)etext, PHYSTOP,
+                         PTE_R | PTE_W,
+                         &small_count, &super_count) < 0)
+    return -1;
+
+  printf("[PASS] kernel data/RAM: PA, page size, RW- permissions\n");
+
+  // Small device mappings must remain 4KB.
+  if (ksuper_check_one(UART0, UART0, 0,
+                       PTE_R | PTE_W) < 0)
+    return -1;
+
+  printf("[PASS] UART: 4KB mapping\n");
+
+  if (ksuper_check_one(VIRTIO0, VIRTIO0, 0,
+                       PTE_R | PTE_W) < 0)
+    return -1;
+
+  printf("[PASS] VIRTIO: 4KB mapping\n");
+
+  // Trampoline is not an identity mapping at its high virtual address.
+  if (ksuper_check_one(TRAMPOLINE, (uint64)trampoline, 0,
+                       PTE_R | PTE_X) < 0)
+    return -1;
+
+  printf("[PASS] trampoline: 4KB, correct PA, R-X permissions\n");
+
+  printf("RAM 4KB mappings: %d\n", small_count);
+  printf("RAM 2MB mappings: %d\n", super_count);
+
+  if (super_count == 0) {
+    printf("FAIL: no 2MB superpage found in kernel RAM\n");
+    return -1;
+  }
+
+  printf("[PASS] aligned 2MB RAM blocks and 4KB boundaries checked\n");
+  return 0;
+}
 
 
 #ifdef LAB_PGTBL
