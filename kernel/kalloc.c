@@ -10,24 +10,36 @@
 #include "defs.h"
 
 void freerange(void *pa_start, void *pa_end);
+void superfree(void *pa);
 
 extern char end[]; // first address after kernel.
                    // defined by kernel.ld.
+
+#define NSUPERPG 32
 
 struct run {
   struct run *next;
 };
 
+struct superrun {
+  struct superrun *next;
+};
+
 struct {
   struct spinlock lock;
   struct run *freelist;
+  struct superrun *superlist;
 } kmem;
 
 void
 kinit()
 {
+  uint64 sstart = PHYSTOP - (uint64)NSUPERPG * SUPERPGSIZE;
+
   initlock(&kmem.lock, "kmem");
-  freerange(end, (void *)PHYSTOP);
+  freerange(end, (void *)sstart);
+  for (uint64 pa = sstart; pa < PHYSTOP; pa += SUPERPGSIZE)
+    superfree((void *)pa);
 }
 
 void
@@ -79,4 +91,40 @@ kalloc(void)
   if (r)
     memset((char *)r, 5, PGSIZE); // fill with junk
   return (void *)r;
+}
+
+void *
+superalloc(void)
+{
+  struct superrun *r;
+
+  acquire(&kmem.lock);
+  r = kmem.superlist;
+  if (r)
+    kmem.superlist = r->next;
+  release(&kmem.lock);
+
+  if (r)
+    memset((char *)r, 5, SUPERPGSIZE);
+  return (void *)r;
+}
+
+void
+superfree(void *pa)
+{
+  struct superrun *r;
+
+  if (((uint64)pa % SUPERPGSIZE) != 0 ||
+      (uint64)pa < PHYSTOP - (uint64)NSUPERPG * SUPERPGSIZE ||
+      (uint64)pa >= PHYSTOP)
+    panic("superfree");
+
+  memset(pa, 1, SUPERPGSIZE);
+
+  r = (struct superrun *)pa;
+
+  acquire(&kmem.lock);
+  r->next = kmem.superlist;
+  kmem.superlist = r;
+  release(&kmem.lock);
 }

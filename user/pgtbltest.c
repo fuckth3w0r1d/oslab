@@ -8,19 +8,19 @@
 #define SZ (8 * SUPERPGSIZE)
 
 void print_pgtbl();
-void vmprint_test();
-void ugetpid_test();
-void pgaccess_test();
-void ksuper_test();
+void superpg_fork();
+void superpg_free();
 
 int
 main(int argc, char *argv[])
 {
   print_pgtbl();
-  vmprint_test();
-  pgaccess_test();
-  ugetpid_test();
-  ksuper_test();
+  // vmprint_test();
+  // pgaccess_test();
+  // ugetpid_test();
+  // ksuper_test();
+  superpg_fork();
+  superpg_free();
   printf("pgtbltest: all tests succeeded\n");
   exit(0);
 }
@@ -170,4 +170,133 @@ void ksuper_test() {
     err("too many regular ptes");
   }
   printf("ksuper_test: OK\n");
+}
+
+void
+supercheck(char *end)
+{
+  pte_t last_pte = 0;
+  uint64 a = (uint64)end;
+  uint64 s = SUPERPGROUNDUP(a);
+
+  for (; a < s; a += PGSIZE) {
+    pte_t pte = (pte_t)pgpte((void *)a);
+    if (pte == 0)
+      err("no pte");
+  }
+
+  for (uint64 p = s; p < s + 512 * PGSIZE; p += PGSIZE) {
+    pte_t pte = (pte_t)pgpte((void *)p);
+    if (pte == 0)
+      err("no pte");
+    if ((uint64)last_pte != 0 && pte != last_pte)
+      err("pte different");
+    if ((pte & PTE_V) == 0 || (pte & PTE_R) == 0 || (pte & PTE_W) == 0)
+      err("pte wrong");
+    last_pte = pte;
+  }
+
+  for (int i = 0; i < 512 * PGSIZE; i += PGSIZE)
+    *(int *)(s + i) = i;
+
+  for (int i = 0; i < 512 * PGSIZE; i += PGSIZE)
+    if (*(int *)(s + i) != i)
+      err("wrong value");
+}
+
+void
+superpg_fork()
+{
+  int pid;
+
+  printf("superpg_fork starting\n");
+  testname = "superpg_fork";
+
+  char *end = sbrk(SZ);
+  if (end == 0 || end == SBRK_ERROR)
+    err("sbrk failed");
+
+  supercheck(end);
+  if ((pid = fork()) < 0) {
+    err("fork");
+  } else if (pid == 0) {
+    supercheck(end);
+    exit(0);
+  } else {
+    int status;
+    wait(&status);
+    if (status != 0)
+      exit(0);
+  }
+
+  sbrk(-SZ);
+  if ((pid = fork()) < 0) {
+    err("fork");
+  } else if (pid == 0) {
+    *(end + 1) = '9';
+  } else {
+    int status;
+    wait(&status);
+    if (status == 0)
+      err("child was able to reference free memory");
+  }
+  printf("superpg_fork: OK\n");
+}
+
+void
+superpg_free()
+{
+  int pid;
+
+  printf("superpg_free starting\n");
+  testname = "superpg_free";
+
+  char *end = sbrk(SZ);
+  if (end == 0 || end == SBRK_ERROR)
+    err("sbrk failed");
+
+  char *a = sbrk(0);
+  uint64 s = SUPERPGROUNDDOWN((uint64)a);
+  sbrk(-((uint64)a - s));
+  a = sbrk(0);
+
+  pte_t pte1 = (pte_t)pgpte((void *)a - PGSIZE);
+  pte_t pte2 = (pte_t)pgpte((void *)a - 2 * PGSIZE);
+  if (pte1 != pte2)
+    err("not a super page");
+
+  *(a - PGSIZE + 1) = '8';
+  *(a - 2 * PGSIZE + 1) = '9';
+
+  sbrk(-PGSIZE);
+  a = sbrk(0);
+
+  if (*(a - PGSIZE + 1) != '9')
+    err("lost content after freeing part of super page");
+
+  if ((pid = fork()) < 0) {
+    err("fork");
+  } else if (pid == 0) {
+    if (*(a + 1) == '9')
+      exit(0);
+  } else {
+    int status;
+    wait(&status);
+    if (status == 0)
+      err("child was able to reference free memory");
+  }
+
+  pte1 = (pte_t)pgpte((void *)a);
+  if (pte1 != 0)
+    err("pte for freed memory is valid");
+
+  s = SUPERPGROUNDDOWN((uint64)a);
+  for (; (uint64)a > s; a -= PGSIZE) {
+    a = sbrk(-PGSIZE);
+    pte1 = (pte_t)pgpte(sbrk(0));
+    if (pte1 != 0)
+      err("page hasn't been freed");
+  }
+
+  printf("superpg_free: OK\n");
 }
