@@ -11,6 +11,8 @@
 
 void freerange(void *pa_start, void *pa_end);
 
+static int refcnt[PHYSTOP/PGSIZE];
+
 extern char end[]; // first address after kernel.
                    // defined by kernel.ld.
 
@@ -51,12 +53,21 @@ kfree(void *pa)
   if (((uint64)pa % PGSIZE) != 0 || (char *)pa < end || (uint64)pa >= PHYSTOP)
     panic("kfree");
 
+  // not the last ref, keep the physical page
+  int i = (uint64)pa / PGSIZE;
+  acquire(&kmem.lock);
+  if (refcnt[i] > 1){
+    refcnt[i]--;
+    release(&kmem.lock);
+    return;
+  }
+  refcnt[i] = 0;
+
   // Fill with junk to catch dangling refs.
   memset(pa, 1, PGSIZE);
 
   r = (struct run *)pa;
 
-  acquire(&kmem.lock);
   r->next = kmem.freelist;
   kmem.freelist = r;
   release(&kmem.lock);
@@ -72,11 +83,25 @@ kalloc(void)
 
   acquire(&kmem.lock);
   r = kmem.freelist;
-  if (r)
+  if (r){
     kmem.freelist = r->next;
+    refcnt[(uint64)r / PGSIZE] = 1;
+  }
+    
   release(&kmem.lock);
 
   if (r)
     memset((char *)r, 5, PGSIZE); // fill with junk
   return (void *)r;
+}
+
+// increase refcnt[] in vm.c/uvmcopy()
+void
+krefinc(void *pa)
+{
+  if(((uint64)pa % PGSIZE)!=0 || (char*)pa < end || (uint64)pa >= PHYSTOP)
+    panic("krefinc");
+  acquire(&kmem.lock);
+  refcnt[(uint64)pa / PGSIZE]++;
+  release(&kmem.lock);
 }

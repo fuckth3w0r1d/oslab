@@ -301,7 +301,6 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
   pte_t *pte;
   uint64 pa, i;
   uint flags;
-  char *mem;
 
   for (i = 0; i < sz; i += PGSIZE) {
     if ((pte = walk(old, i, 0)) == 0)
@@ -309,14 +308,17 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
     if ((*pte & PTE_V) == 0)
       continue; // physical page hasn't been allocated
     pa = PTE2PA(*pte);
+    // let parent page map to child
+    // not allcate the memory and remove the "W" flag
+    if (*pte & PTE_W){
+      *pte &= ~PTE_W;
+      *pte |= PTE_COW;
+    }
     flags = PTE_FLAGS(*pte);
-    if ((mem = kalloc()) == 0)
-      goto err;
-    memmove(mem, (char *)pa, PGSIZE);
-    if (mappages(new, i, PGSIZE, (uint64)mem, flags) != 0) {
-      kfree(mem);
+    if (mappages(new, i, PGSIZE, pa, flags) != 0){
       goto err;
     }
+    krefinc((void*)pa);
   }
   return 0;
 
@@ -361,9 +363,15 @@ copyout(pagetable_t pagetable, uint64 psz, uint64 dstva, char *src, uint64 len)
 
     pte = walk(pagetable, va0, 0);
     // forbid copyout over read-only user text pages.
-    if ((*pte & PTE_W) == 0)
-      return -1;
-
+    // add COW copy
+    if ((*pte & PTE_W) == 0){
+      if ((*pte & PTE_COW) == 0){
+        return -1;
+      } 
+      if ((pa0 =vmfault(pagetable, psz, va0, 0)) == 0){
+        return -1;
+      }
+    }
     n = PGSIZE - (dstva - va0);
     if (n > len)
       n = len;
@@ -459,13 +467,30 @@ uint64
 vmfault(pagetable_t pagetable, uint64 psz, uint64 va, int read)
 {
   uint64 mem;
+  pte_t *pte;
+  uint64 pa;
+  uint64 flags;
 
   if (va >= psz)
     return 0;
   va = PGROUNDDOWN(va);
-  if (ismapped(pagetable, va)) {
-    return 0;
+  pte = walk(pagetable, va, 0);
+  // case1 COW page
+  if (pte != 0 && (*pte & PTE_V)) {
+    if ((*pte & PTE_COW) == 0 || (*pte & PTE_U) == 0 || read)
+      return 0;
+    pa = PTE2PA(*pte);
+    mem = (uint64)kalloc();
+    if (mem == 0)
+      return 0;
+    memmove((void *)mem, (void *)pa, PGSIZE);
+    flags = (PTE_FLAGS(*pte) | PTE_W) & ~PTE_COW;
+    *pte = PA2PTE(mem) | flags;
+    kfree((void *)pa);
+    return mem;
   }
+
+  // case2 unmapped page
   mem = (uint64)kalloc();
   if (mem == 0)
     return 0;
