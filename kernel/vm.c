@@ -17,6 +17,8 @@ extern char etext[]; // kernel.ld sets this to end of kernel code.
 
 extern char trampoline[]; // trampoline.S
 
+static uint64 cow_resolve(pagetable_t pagetable, uint64 va);
+
 // Make a direct-map page table for the kernel.
 pagetable_t
 kvmmake(void)
@@ -301,23 +303,39 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
   pte_t *pte;
   uint64 pa, i;
   uint flags;
-  char *mem;
+  // char *mem;
 
   for (i = 0; i < sz; i += PGSIZE) {
-    if ((pte = walk(old, i, 0)) == 0)
+    if ((pte = walk(old, i, 0)) == 0)//将old页虚拟地址的i虚拟地址的物理地址存放到pte中
       continue; // page table entry hasn't been allocated
     if ((*pte & PTE_V) == 0)
       continue; // physical page hasn't been allocated
     pa = PTE2PA(*pte);
     flags = PTE_FLAGS(*pte);
-    if ((mem = kalloc()) == 0)
+    // if ((mem = kalloc()) == 0)
+    //   goto err;
+    // memmove(mem, (char *)pa, PGSIZE);
+
+    if (flags & PTE_W)
+      flags = (flags & ~PTE_W) | PTE_COW;
+
+    if (mappages(new, i, PGSIZE, pa, flags) != 0)//创建映射
       goto err;
-    memmove(mem, (char *)pa, PGSIZE);
-    if (mappages(new, i, PGSIZE, (uint64)mem, flags) != 0) {
-      kfree(mem);
-      goto err;
-    }
+
+    kref_inc(pa);
   }
+
+  for (i = 0; i < sz; i+= PGSIZE) {
+    if ((pte = walk(old, i, 0)) == 0)
+      continue;
+    if ((*pte & PTE_V) == 0)
+      continue;
+
+    if (*pte & PTE_W) 
+      *pte = (*pte & ~PTE_W) | PTE_COW;
+  }
+
+  sfence_vma();
   return 0;
 
 err:
@@ -349,7 +367,7 @@ copyout(pagetable_t pagetable, uint64 psz, uint64 dstva, char *src, uint64 len)
 
   while (len > 0) {
     va0 = PGROUNDDOWN(dstva);
-    if (va0 >= MAXVA)
+    if (va0 >= MAXVA || dstva >= psz)
       return -1;
 
     pa0 = walkaddr(pagetable, va0);
@@ -360,6 +378,19 @@ copyout(pagetable_t pagetable, uint64 psz, uint64 dstva, char *src, uint64 len)
     }
 
     pte = walk(pagetable, va0, 0);
+
+    if (pte == 0 || 
+        (*pte & PTE_V) == 0 ||
+        (*pte & PTE_U) == 0)
+      return -1;
+
+    if (*pte & PTE_COW) {
+      pa0 = cow_resolve(pagetable, va0);
+
+      if (pa0 == 0)
+        return -1;
+    }
+
     // forbid copyout over read-only user text pages.
     if ((*pte & PTE_W) == 0)
       return -1;
@@ -451,6 +482,56 @@ copyinstr(pagetable_t pagetable, uint64 psz, char *dst, uint64 srcva,
   }
 }
 
+static uint64
+cow_resolve(pagetable_t pagetable, uint64 va)
+{
+  pte_t *pte;
+  uint64 oldpa;
+  uint flags;
+  char *mem;
+
+  va = PGROUNDDOWN(va);
+
+  if (va >= MAXVA)
+    return 0;
+
+  pte = walk(pagetable, va, 0);
+
+  if (pte == 0)
+    return 0;
+
+  if ((*pte & PTE_V) == 0 ||
+      (*pte & PTE_U) == 0 ||
+      (*pte & PTE_COW) == 0)
+    return 0;
+
+  oldpa = PTE2PA(*pte);
+
+  if (kref_get(oldpa) == 1) {
+    *pte = (*pte | PTE_W) & ~PTE_COW;
+    sfence_vma();
+    return oldpa;
+  }
+
+  mem = kalloc();
+
+  if (mem == 0)
+    return 0;
+
+  memmove(mem, (char *)oldpa, PGSIZE);
+
+  flags = PTE_FLAGS(*pte);
+  flags = (flags | PTE_W) & ~PTE_COW;
+
+  *pte = PA2PTE((uint64)mem) | flags;
+
+  sfence_vma();
+
+  kfree((void *)oldpa);//此处为解引用一次，不是释放旧页
+
+  return (uint64)mem;
+}
+
 // allocate and map user memory if process is referencing a page
 // that was lazily allocated in sys_sbrk().
 // returns 0 if va is invalid or already mapped, or if
@@ -459,13 +540,25 @@ uint64
 vmfault(pagetable_t pagetable, uint64 psz, uint64 va, int read)
 {
   uint64 mem;
+  pte_t *pte;
 
-  if (va >= psz)
+  if (va >= psz || va >= MAXVA)
     return 0;
   va = PGROUNDDOWN(va);
-  if (ismapped(pagetable, va)) {
+  // if (ismapped(pagetable, va)) {
+  //   return 0;
+  // }
+
+  pte = walk(pagetable, va, 0);
+
+  if (pte != 0 && (*pte & PTE_V)) {
+    if (read == 0 && (*pte & PTE_COW))
+      return cow_resolve(pagetable, va);
+
     return 0;
   }
+      
+
   mem = (uint64)kalloc();
   if (mem == 0)
     return 0;

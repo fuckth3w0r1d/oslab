@@ -23,10 +23,23 @@ struct {
   struct run *freelist;
 } kmem;
 
+struct {
+  struct spinlock lock;
+  int count[PHYSTOP / PGSIZE];
+} ref;
+
 void
 kinit()
 {
   initlock(&kmem.lock, "kmem");
+  initlock(&ref.lock, "ref");
+
+  char *p;
+  p = (char *)PGROUNDUP((uint64)end);
+  for (; p + PGSIZE <= (char *)PHYSTOP; p += PGSIZE) {
+    ref.count[(uint64)p / PGSIZE] = 1;
+  }
+
   freerange(end, (void *)PHYSTOP);
 }
 
@@ -37,6 +50,37 @@ freerange(void *pa_start, void *pa_end)
   p = (char *)PGROUNDUP((uint64)pa_start);
   for (; p + PGSIZE <= (char *)pa_end; p += PGSIZE)
     kfree(p);
+}
+
+void
+kref_inc(uint64 pa)
+{
+  if (pa % PGSIZE != 0 || (char *)pa < end || pa >= PHYSTOP)
+    panic("kref_inc");
+
+  acquire(&ref.lock);
+
+  if (ref.count[pa / PGSIZE] < 1)
+    panic("kref_inc: invalid count");
+
+  ref.count[pa / PGSIZE]++;
+
+  release(&ref.lock);
+}
+
+int
+kref_get(uint64 pa)
+{
+  int n;
+
+  if (pa % PGSIZE != 0 || (char *)pa < end || pa >= PHYSTOP)
+    panic("kref_get");
+
+  acquire(&ref.lock);
+  n = ref.count[pa / PGSIZE];
+  release(&ref.lock);
+
+  return n;
 }
 
 // Free the page of physical memory pointed at by pa,
@@ -51,6 +95,19 @@ kfree(void *pa)
   if (((uint64)pa % PGSIZE) != 0 || (char *)pa < end || (uint64)pa >= PHYSTOP)
     panic("kfree");
 
+  acquire(&ref.lock);
+
+  if (ref.count[(uint64)pa / PGSIZE] < 1)
+    panic("kfree: invalid count");
+
+  ref.count[(uint64)pa / PGSIZE] --;
+
+  if (ref.count[(uint64)pa / PGSIZE] > 0) 
+  {
+    release(&ref.lock);
+    return;
+  }
+
   // Fill with junk to catch dangling refs.
   memset(pa, 1, PGSIZE);
 
@@ -60,6 +117,7 @@ kfree(void *pa)
   r->next = kmem.freelist;
   kmem.freelist = r;
   release(&kmem.lock);
+  release(&ref.lock);
 }
 
 // Allocate one 4096-byte page of physical memory.
@@ -69,11 +127,25 @@ void *
 kalloc(void)
 {
   struct run *r;
-
+  
   acquire(&kmem.lock);
   r = kmem.freelist;
   if (r)
     kmem.freelist = r->next;
+
+  // release(&kmem.lock);
+
+  if (r) {
+    acquire(&ref.lock);
+
+    if (ref.count[(uint64)r / PGSIZE] != 0)
+      panic("kalloc: invalid count");
+
+    ref.count[(uint64)r / PGSIZE] = 1;
+
+    release(&ref.lock);
+  }
+  
   release(&kmem.lock);
 
   if (r)
