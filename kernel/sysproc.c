@@ -77,19 +77,19 @@ sys_pause(void)
   argint(0, &n);
   if (n < 0)
     n = 0;
-  acquire(&tickslock);
+  read_acquire(&tickslock);
   ticks0 = ticks;
   while (ticks - ticks0 < n) {
     if (killed(myproc())) {
-      release(&tickslock);
+      read_release(&tickslock);
       return -1;
     }
     sleep_prepare(&ticks);
-    release(&tickslock);
+    read_release(&tickslock);
     sleep();
-    acquire(&tickslock);
+    read_acquire(&tickslock);
   }
-  release(&tickslock);
+  read_release(&tickslock);
   return 0;
 }
 
@@ -131,9 +131,9 @@ sys_uptime(void)
 {
   uint xticks;
 
-  acquire(&tickslock);
+  read_acquire(&tickslock);
   xticks = ticks;
-  release(&tickslock);
+  read_release(&tickslock);
   return xticks;
 }
 
