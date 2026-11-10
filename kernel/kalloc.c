@@ -9,6 +9,12 @@
 #include "riscv.h"
 #include "defs.h"
 
+// Number of physical pages in the RAM range managed by xv6.
+#define NPAGES ((PHYSTOP - KERNBASE) / PGSIZE)
+
+// Convert a page-aligned physical address to a reference-count index.
+#define PAGE_INDEX(pa) (((uint64)(pa) - KERNBASE) / PGSIZE)
+
 void freerange(void *pa_start, void *pa_end);
 
 extern char end[]; // first address after kernel.
@@ -21,6 +27,7 @@ struct run {
 struct {
   struct spinlock lock;
   struct run *freelist;
+  int refcnt[NPAGES];
 } kmem;
 
 void
@@ -34,9 +41,14 @@ void
 freerange(void *pa_start, void *pa_end)
 {
   char *p;
-  p = (char*)PGROUNDUP((uint64)pa_start);
-  for(; p + PGSIZE <= (char*)pa_end; p += PGSIZE)
+
+  p = (char *)PGROUNDUP((uint64)pa_start);
+
+  for(; p + PGSIZE <= (char *)pa_end; p += PGSIZE){
+    // Boot-time initialization: kfree() will decrement this to zero.
+    kmem.refcnt[PAGE_INDEX(p)] = 1;
     kfree(p);
+  }
 }
 
 // Free the page of physical memory pointed at by pa,
@@ -47,18 +59,35 @@ void
 kfree(void *pa)
 {
   struct run *r;
+  uint64 index;
 
-  if(((uint64)pa % PGSIZE) != 0 || (char*)pa < end || (uint64)pa >= PHYSTOP)
+  if(((uint64)pa % PGSIZE) != 0 ||
+     (char *)pa < end ||
+     (uint64)pa >= PHYSTOP)
     panic("kfree");
 
-  // Fill with junk to catch dangling refs.
-  memset(pa, 1, PGSIZE);
-
-  r = (struct run*)pa;
+  index = PAGE_INDEX(pa);
 
   acquire(&kmem.lock);
+
+  if(kmem.refcnt[index] < 1)
+    panic("kfree: bad refcount");
+
+  kmem.refcnt[index]--;
+
+  // Other mappings still use this page.
+  if(kmem.refcnt[index] > 0){
+    release(&kmem.lock);
+    return;
+  }
+
+  // No references remain; the page can now be recycled.
+  memset(pa, 1, PGSIZE);
+
+  r = (struct run *)pa;
   r->next = kmem.freelist;
   kmem.freelist = r;
+
   release(&kmem.lock);
 }
 
@@ -71,12 +100,37 @@ kalloc(void)
   struct run *r;
 
   acquire(&kmem.lock);
+
   r = kmem.freelist;
-  if(r)
+
+  if(r){
     kmem.freelist = r->next;
+    kmem.refcnt[PAGE_INDEX(r)] = 1;
+  }
+
   release(&kmem.lock);
 
   if(r)
-    memset((char*)r, 5, PGSIZE); // fill with junk
-  return (void*)r;
+    memset((char *)r, 5, PGSIZE);
+
+  return (void *)r;
+}
+
+// Add one reference to an allocated physical page.
+void
+krefinc(uint64 pa)
+{
+  if((pa % PGSIZE) != 0 ||
+     pa < (uint64)end ||
+     pa >= PHYSTOP)
+    panic("krefinc");
+
+  acquire(&kmem.lock);
+
+  if(kmem.refcnt[PAGE_INDEX(pa)] < 1)
+    panic("krefinc: free page");
+
+  kmem.refcnt[PAGE_INDEX(pa)]++;
+
+  release(&kmem.lock);
 }

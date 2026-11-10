@@ -299,27 +299,42 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
   pte_t *pte;
   uint64 pa, i;
   uint flags;
-  char *mem;
 
   for(i = 0; i < sz; i += PGSIZE){
-    if((pte = walk(old, i, 0)) == 0)
-      continue;   // page table entry hasn't been allocated
+    pte = walk(old, i, 0);
+
+    // Preserve holes created by lazy allocation.
+    if(pte == 0)
+      continue;
+
     if((*pte & PTE_V) == 0)
-      continue;   // physical page hasn't been allocated
+      continue;
+
     pa = PTE2PA(*pte);
     flags = PTE_FLAGS(*pte);
-    if((mem = kalloc()) == 0)
+
+    // Only originally writable pages become COW pages.
+    if(flags & PTE_W)
+      flags = (flags & ~PTE_W) | PTE_COW;
+
+    // Map the same physical page into the child.
+    if(mappages(new, i, PGSIZE, pa, flags) != 0)
       goto err;
-    memmove(mem, (char*)pa, PGSIZE);
-    if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
-      kfree(mem);
-      goto err;
-    }
+
+    // The child now owns an additional reference.
+    krefinc(pa);
+
+    // Give the parent the same permissions.
+    *pte = PA2PTE(pa) | flags;
   }
+
+  sfence_vma();
   return 0;
 
- err:
+err:
+  // Drop every child mapping successfully installed so far.
   uvmunmap(new, 0, i / PGSIZE, 1);
+  sfence_vma();
   return -1;
 }
 
@@ -336,6 +351,56 @@ uvmclear(pagetable_t pagetable, uint64 va)
   *pte &= ~PTE_U;
 }
 
+// Make a COW user page private and writable.
+// Return the new physical page address, or 0 on failure.
+static uint64
+cowbreak(pagetable_t pagetable, uint64 va)
+{
+  pte_t *pte;
+  uint64 oldpa;
+  uint flags;
+  char *mem;
+
+  if(va >= MAXVA)
+    return 0;
+
+  va = PGROUNDDOWN(va);
+
+  pte = walk(pagetable, va, 0);
+
+  if(pte == 0)
+    return 0;
+
+  // Only a valid, user-accessible, read-only COW page is eligible.
+  if((*pte & PTE_V) == 0 ||
+     (*pte & PTE_U) == 0 ||
+     (*pte & PTE_COW) == 0 ||
+     (*pte & PTE_W) != 0)
+    return 0;
+
+  oldpa = PTE2PA(*pte);
+  flags = PTE_FLAGS(*pte);
+
+  mem = kalloc();
+  if(mem == 0)
+    return 0;
+
+  // Copy the complete old page before changing its mapping.
+  memmove(mem, (void *)oldpa, PGSIZE);
+
+  flags = (flags | PTE_W) & ~PTE_COW;
+
+  // Replace the existing leaf PTE directly.
+  *pte = PA2PTE((uint64)mem) | flags;
+
+  sfence_vma();
+
+  // This process no longer references the old shared page.
+  kfree((void *)oldpa);
+
+  return (uint64)mem;
+}
+
 // Copy from kernel to user.
 // Copy len bytes from src to virtual address dstva in a given page table.
 // Return 0 on success, -1 on error.
@@ -347,30 +412,55 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
 
   while(len > 0){
     va0 = PGROUNDDOWN(dstva);
+
     if(va0 >= MAXVA)
       return -1;
-  
+
+    // Preserve lazy allocation for an unmapped destination.
     pa0 = walkaddr(pagetable, va0);
-    if(pa0 == 0) {
-      if((pa0 = vmfault(pagetable, va0, 0)) == 0) {
+    if(pa0 == 0){
+      if(vmfault(pagetable, va0, 0) == 0)
         return -1;
-      }
     }
 
     pte = walk(pagetable, va0, 0);
-    // forbid copyout over read-only user text pages.
+
+    if(pte == 0 ||
+       (*pte & PTE_V) == 0 ||
+       (*pte & PTE_U) == 0)
+      return -1;
+
+    // Kernel writes must also break COW sharing.
+    if((*pte & PTE_COW) && ((*pte & PTE_W) == 0)){
+      if(cowbreak(pagetable, va0) == 0){
+        // COW could not obtain a private page.
+        setkilled(myproc());
+        return -1;
+      }
+
+      // The mapping may now refer to a different physical page.
+      pte = walk(pagetable, va0, 0);
+      if(pte == 0)
+        return -1;
+    }
+
+    // Never write to an ordinary read-only user page.
     if((*pte & PTE_W) == 0)
       return -1;
-      
+
+    pa0 = PTE2PA(*pte);
+
     n = PGSIZE - (dstva - va0);
     if(n > len)
       n = len;
+
     memmove((void *)(pa0 + (dstva - va0)), src, n);
 
     len -= n;
     src += n;
     dstva = va0 + PGSIZE;
   }
+
   return 0;
 }
 
@@ -452,23 +542,45 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
 uint64
 vmfault(pagetable_t pagetable, uint64 va, int read)
 {
-  uint64 mem;
   struct proc *p = myproc();
+  pte_t *pte;
+  uint64 mem;
 
-  if (va >= p->sz)
+  // Check the original fault address before rounding it down.
+  if(va >= MAXVA || va >= p->sz)
     return 0;
+
   va = PGROUNDDOWN(va);
-  if(ismapped(pagetable, va)) {
+
+  pte = walk(pagetable, va, 0);
+
+  if(pte != 0 && (*pte & PTE_V)){
+    // An existing mapping can only be repaired here for a COW write.
+    if(read == 0 &&
+       (*pte & PTE_U) &&
+       (*pte & PTE_COW) &&
+       ((*pte & PTE_W) == 0)){
+      return cowbreak(pagetable, va);
+    }
+
+    // For example: writing a genuinely read-only text page,
+    // or accessing the non-user stack guard page.
     return 0;
   }
-  mem = (uint64) kalloc();
+
+  // Preserve the original lazy-allocation behavior for unmapped pages.
+  mem = (uint64)kalloc();
   if(mem == 0)
     return 0;
-  memset((void *) mem, 0, PGSIZE);
-  if (mappages(p->pagetable, va, PGSIZE, mem, PTE_W|PTE_U|PTE_R) != 0) {
+
+  memset((void *)mem, 0, PGSIZE);
+
+  if(mappages(pagetable, va, PGSIZE, mem,
+              PTE_R | PTE_W | PTE_U) != 0){
     kfree((void *)mem);
     return 0;
   }
+
   return mem;
 }
 
