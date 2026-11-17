@@ -81,9 +81,12 @@ usertrap(void)
   if (killed(p))
     kexit(-1);
 
-  // give up the CPU if this is a timer interrupt.
-  if (which_dev == 2)
+  // give up the CPU if this is a timer interrupt and the process used
+  // up its time slice or a higher priority process became runnable.
+  if (which_dev == 2 && mycpu()->resched) {
+    mycpu()->resched = 0;
     yield();
+  }
 
   prepare_return();
 
@@ -153,9 +156,12 @@ kerneltrap()
     panic("kerneltrap");
   }
 
-  // give up the CPU if this is a timer interrupt.
-  if (which_dev == 2 && myproc() != 0)
+  // give up the CPU if this is a timer interrupt and the process used
+  // up its time slice or a higher priority process became runnable.
+  if (which_dev == 2 && myproc() != 0 && mycpu()->resched) {
+    mycpu()->resched = 0;
     yield();
+  }
 
   // the yield() may have caused some traps to occur,
   // so restore trap registers for use by kernelvec.S's sepc instruction.
@@ -166,9 +172,13 @@ kerneltrap()
 void
 clockintr()
 {
+  sched_tick();
+
   if (cpuid() == 0) {
     write_acquire(&tickslock);
     ticks++;
+    if (ticks % BOOST_TICKS == 0)
+      sched_boost_epoch();
     wakeup(&ticks);
     write_release(&tickslock);
   }

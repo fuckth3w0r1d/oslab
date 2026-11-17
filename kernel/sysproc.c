@@ -137,6 +137,21 @@ sys_uptime(void)
   return xticks;
 }
 
+uint64
+sys_setpriority(void)
+{
+  int prio;
+
+  argint(0, &prio);
+  return ksetpriority(prio);
+}
+
+uint64
+sys_getpriority(void)
+{
+  return kgetpriority();
+}
+
 #ifdef LAB_LOCK
 uint64
 sys_cpupin(void)

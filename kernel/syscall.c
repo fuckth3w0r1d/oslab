@@ -122,6 +122,8 @@ extern uint64 sys_ksupernpte(void);
 #ifdef LAB_LOCK
 extern uint64 sys_cpupin(void);
 #endif
+extern uint64 sys_setpriority(void);
+extern uint64 sys_getpriority(void);
 
 // An array mapping syscall numbers from syscall.h
 // to the function that handles the system call.
@@ -165,6 +167,8 @@ static uint64 (*syscalls[])(void) = {
   [SYS_rwlktest] = sys_rwlktest,
   [SYS_cpupin] = sys_cpupin,
 #endif
+  [SYS_setpriority] = sys_setpriority,
+  [SYS_getpriority] = sys_getpriority,
   // clang-format on
 };
 

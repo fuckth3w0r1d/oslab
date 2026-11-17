@@ -40,3 +40,5 @@
 #define SYS_cpupin    37
 #define SYS_pgaccess  38
 #define SYS_ksupernpte  39
+#define SYS_setpriority 40
+#define SYS_getpriority 41

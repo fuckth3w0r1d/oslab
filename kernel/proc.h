@@ -18,12 +18,25 @@ struct context {
   uint64 s11;
 };
 
+#define NPRIO       4  // run queue levels, 0 is the highest priority
+#define BOOST_TICKS 50 // ticks between two passes of the aging mechanism
+
+// Per-CPU run queue. head[i]/tail[i] link the processes waiting at level i.
+struct runq {
+  struct spinlock lock;
+  struct proc *head[NPRIO];
+  struct proc *tail[NPRIO];
+};
+
 // Per-CPU state.
 struct cpu {
   struct proc *proc;      // The process running on this cpu, or null.
   struct context context; // swtch() here to enter scheduler().
+  struct runq rq;         // processes waiting for this cpu
   int noff;               // Depth of push_off() nesting.
   int intena;             // Were interrupts enabled before push_off()?
+  int resched;            // this cpu should run the scheduler again
+  uint boost_seen;        // aging epoch last applied to rq
 };
 
 extern struct cpu cpus[NCPU];
@@ -104,4 +117,12 @@ struct proc {
 #ifdef LAB_LOCK
   struct cpu *pincpu;
 #endif
+
+  // p->lock guards these while p is running, the run queue lock of
+  // the cpu that p is queued on guards them while p is runnable:
+  int prio;           // run queue level, 0 is the highest priority
+  int remaining;      // ticks left in the current time slice
+  int ticks_used;     // ticks used since the last level change
+  int cpu;            // cpu p last ran on, -1 if it never ran
+  struct proc *qnext; // next process at the same level of the run queue
 };

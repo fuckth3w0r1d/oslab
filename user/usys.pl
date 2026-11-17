@@ -53,3 +53,5 @@ entry("rwlktest");
 entry("cpupin");
 entry("pgaccess");
 entry("ksupernpte");
+entry("setpriority");
+entry("getpriority");

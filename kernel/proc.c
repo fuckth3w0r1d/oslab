@@ -26,6 +26,19 @@ extern char trampoline[]; // trampoline.S
 // must be acquired before any p->lock.
 struct spinlock wait_lock;
 
+static int quantum[NPRIO] = {2, 4, 8, 16};
+
+// bumped by cpu 0 every BOOST_TICKS ticks; each cpu applies the new
+// epoch to its own run queue, which lifts every waiting process to
+// level 0 so that a steady stream of high priority work cannot starve
+// the lower levels.
+static uint boost_epoch;
+
+static void runq_add(struct proc *, int);
+static struct proc *runq_pick(int);
+static void sched_boost(struct cpu *);
+static int sched_cpu(struct proc *);
+
 // Allocate a page for each process's kernel stack.
 // Map it high in memory, followed by an invalid
 // guard page.
@@ -51,6 +64,11 @@ procinit(void)
 
   initlock(&pid_lock, "nextpid");
   initlock(&wait_lock, "wait_lock");
+  for (int i = 0; i < NCPU; i++) {
+    initlock(&cpus[i].rq.lock, "runq");
+    cpus[i].resched = 0;
+    cpus[i].boost_seen = 0;
+  }
   for (p = proc; p < &proc[NPROC]; p++) {
     initlock(&p->lock, "proc");
     p->state = UNUSED;
@@ -134,6 +152,12 @@ found:
 #ifdef LAB_LOCK
   p->pincpu = 0;
 #endif
+
+  p->prio = 0;
+  p->remaining = quantum[0];
+  p->ticks_used = 0;
+  p->cpu = -1;
+  p->qnext = 0;
 
   // An empty user page table.
   p->pagetable = proc_pagetable(p);
@@ -232,6 +256,8 @@ userinit(void)
   p->state = RUNNABLE;
 
   release(&p->lock);
+
+  runq_add(p, cpuid());
 }
 
 // Grow or shrink user memory by n bytes.
@@ -306,6 +332,8 @@ kfork(void)
   np->state = RUNNABLE;
 
   release(&np->lock);
+
+  runq_add(np, sched_cpu(np));
 
   return pid;
 }
@@ -448,43 +476,37 @@ scheduler(void)
     intr_on();
     intr_off();
 
-    int nproc = 0;
-    for (p = proc; p < &proc[NPROC]; p++) {
-      acquire(&p->lock);
-      if (p->state != UNUSED) {
-        nproc++;
-      }
-#ifdef LAB_LOCK
-      if (p->pincpu && p->pincpu != c) {
-        release(&p->lock);
-        continue;
-      }
-#endif
-      if (p->state == RUNNABLE) {
-        // Switch to chosen process.  It is the process's job
-        // to release its lock and then reacquire it
-        // before jumping back to us.
-        p->state = RUNNING;
-        c->proc = p;
+    c->resched = 0;
+    sched_boost(c);
 
-        swtch(&c->context, &p->context);
-
-        // Don't re-enable interrupts on release.
-        mycpu()->intena = 0;
-
-        // Process is done running for now.
-        // It should have changed its p->state before coming back.
-        c->proc = 0;
-      }
-      release(&p->lock);
-    }
-    if (nproc <= 2) { // only init and sh exist
+    p = runq_pick(cpuid());
+    if (p == 0) {
       // nothing to run; stop running on this core until an interrupt.
-      intr_on();
-#ifndef LAB_FS
       asm volatile("wfi");
-#endif
+      continue;
     }
+
+    acquire(&p->lock);
+    if (p->state != RUNNABLE)
+      panic("runq");
+    p->state = RUNNING;
+    p->cpu = cpuid();
+    c->proc = p;
+
+    swtch(&c->context, &p->context);
+
+    // Don't re-enable interrupts on release.
+    mycpu()->intena = 0;
+
+    // Process is done running for now. It is the process's job to
+    // change p->state before coming back; if it only gave up the cpu,
+    // put it back on the queue of the cpu it ran on.
+    int again = (p->state == RUNNABLE);
+    c->proc = 0;
+    release(&p->lock);
+
+    if (again)
+      runq_add(p, cpuid());
   }
 }
 
@@ -516,6 +538,8 @@ sched(void)
 }
 
 // Give up the CPU for one scheduling round.
+// The process is put back on the run queue by scheduler() once it
+// switches back, so that no cpu holds two locks at the same time.
 void
 yield(void)
 {
@@ -585,10 +609,144 @@ sleep(void)
 
   acquire(&p->lock);
   if (p->chan != 0) {
+    // Blocking before the time slice is used up means the process is
+    // waiting on something else, not burning cpu, so it keeps its
+    // level; a process that never blocks sinks instead.
+    if (p->ticks_used < quantum[p->prio] / 2 && p->prio > 0)
+      p->prio--;
+    p->ticks_used = 0;
+    p->remaining = quantum[p->prio];
+
     p->state = SLEEPING;
     sched();
   }
   release(&p->lock);
+}
+
+// Return the cpu a woken process should be queued on: the one it last
+// ran on, so that its cache content is still warm, else this cpu.
+static int
+sched_cpu(struct proc *p)
+{
+  int id = p->cpu;
+  if (id < 0 || id >= NCPU)
+    return cpuid();
+  return id;
+}
+
+// Append p to level p->prio of the run queue of cpu. Caller must hold
+// p->lock and must not hold any run queue lock.
+static void
+runq_add(struct proc *p, int cpu)
+{
+  struct runq *q = &cpus[cpu].rq;
+  int i = p->prio;
+
+  if (i < 0)
+    i = 0;
+  if (i >= NPRIO)
+    i = NPRIO - 1;
+
+  acquire(&q->lock);
+  p->qnext = 0;
+  if (q->tail[i])
+    q->tail[i]->qnext = p;
+  else
+    q->head[i] = p;
+  q->tail[i] = p;
+  release(&q->lock);
+
+  // Preempt the process running on that cpu if it has a lower priority.
+  if (cpus[cpu].proc && cpus[cpu].proc->prio > i)
+    cpus[cpu].resched = 1;
+}
+
+// Lift every process waiting on this cpu to level 0, at most once per
+// aging epoch.
+static void
+sched_boost(struct cpu *c)
+{
+  struct runq *q = &c->rq;
+  uint epoch = __atomic_load_n(&boost_epoch, __ATOMIC_ACQUIRE);
+
+  if (c->boost_seen == epoch)
+    return;
+
+  acquire(&q->lock);
+  for (int i = 1; i < NPRIO; i++) {
+    for (struct proc *p = q->head[i]; p; p = p->qnext) {
+      p->prio = 0;
+      p->remaining = quantum[0];
+    }
+    if (q->head[i]) {
+      q->tail[i]->qnext = q->head[0];
+      if (q->tail[0] == 0)
+        q->tail[0] = q->tail[i];
+      q->head[0] = q->head[i];
+      q->head[i] = 0;
+      q->tail[i] = 0;
+    }
+  }
+  release(&q->lock);
+
+  c->boost_seen = epoch;
+}
+
+// Take the highest priority process waiting on cpu, then steal from the
+// other cpus if this one has nothing to run.
+static struct proc *
+runq_pick(int cpu)
+{
+  struct runq *q = &cpus[cpu].rq;
+  struct proc *p = 0;
+
+  acquire(&q->lock);
+  for (int i = 0; i < NPRIO; i++) {
+    if (q->head[i] == 0)
+      continue;
+    p = q->head[i];
+    q->head[i] = p->qnext;
+    if (q->head[i] == 0)
+      q->tail[i] = 0;
+    p->qnext = 0;
+    break;
+  }
+  release(&q->lock);
+
+  if (p)
+    return p;
+
+  // Work stealing: take the tail of the lowest level of another cpu, so
+  // that the processes that waited longest move and the victim keeps
+  // the ones it is about to run.
+  for (int k = 1; k < NCPU; k++) {
+    struct runq *v = &cpus[(cpu + k) % NCPU].rq;
+
+    acquire(&v->lock);
+    for (int i = NPRIO - 1; i >= 0 && p == 0; i--) {
+      if (v->head[i] == 0)
+        continue;
+      struct proc *prev = 0;
+      struct proc *t = v->head[i];
+      while (t->qnext) {
+        prev = t;
+        t = t->qnext;
+      }
+      if (prev)
+        prev->qnext = 0;
+      else
+        v->head[i] = 0;
+      v->tail[i] = prev;
+      t->qnext = 0;
+      p = t;
+    }
+    release(&v->lock);
+
+    if (p)
+      return p;
+  }
+
+  return 0;
 }
 
 // Wake up all processes sleeping on channel chan.
@@ -598,6 +756,8 @@ wakeup(void *chan)
   struct proc *p;
 
   for (p = proc; p < &proc[NPROC]; p++) {
+    int woken = 0;
+
     acquire(&p->lock);
     if (p->chan == chan) {
       // If the process is waiting for wakeups on this channel,
@@ -608,9 +768,13 @@ wakeup(void *chan)
       // go to sleep, also set it back to RUNNING.
       if (p->state == SLEEPING) {
         p->state = RUNNABLE;
+        woken = 1;
       }
     }
     release(&p->lock);
+
+    if (woken)
+      runq_add(p, sched_cpu(p));
   }
 }
 
@@ -623,14 +787,19 @@ kkill(int pid)
   struct proc *p;
 
   for (p = proc; p < &proc[NPROC]; p++) {
+    int woken = 0;
+
     acquire(&p->lock);
     if (p->pid == pid) {
       p->killed = 1;
       if (p->state == SLEEPING) {
         // Wake process from sleep().
         p->state = RUNNABLE;
+        woken = 1;
       }
       release(&p->lock);
+      if (woken)
+        runq_add(p, sched_cpu(p));
       return 0;
     }
     release(&p->lock);
@@ -655,6 +824,61 @@ killed(struct proc *p)
   k = p->killed;
   release(&p->lock);
   return k;
+}
+
+// Account one tick of cpu time to the running process. Called from
+// the timer interrupt, where no lock is held.
+void
+sched_tick(void)
+{
+  struct proc *p = myproc();
+  struct cpu *c = mycpu();
+
+  if (p == 0)
+    return;
+
+  acquire(&p->lock);
+  p->ticks_used++;
+  if (--p->remaining <= 0) {
+    // The process used up its time slice without blocking, so it is
+    // cpu bound and drops one level; scheduler() picks a new process.
+    if (p->prio < NPRIO - 1)
+      p->prio++;
+    p->remaining = quantum[p->prio];
+    p->ticks_used = 0;
+    c->resched = 1;
+  }
+  release(&p->lock);
+}
+
+// Start a new aging epoch; every cpu lifts its run queue to level 0
+// before its next scheduling decision.
+void
+sched_boost_epoch(void)
+{
+  __atomic_fetch_add(&boost_epoch, 1, __ATOMIC_RELEASE);
+}
+
+int
+ksetpriority(int prio)
+{
+  struct proc *p = myproc();
+
+  if (prio < 0 || prio >= NPRIO)
+    return -1;
+
+  acquire(&p->lock);
+  p->prio = prio;
+  p->remaining = quantum[prio];
+  p->ticks_used = 0;
+  release(&p->lock);
+  return 0;
+}
+
+int
+kgetpriority(void)
+{
+  return myproc()->prio;
 }
 
 // Copy to either a user address, or kernel address,
@@ -714,7 +938,7 @@ procdump(void)
       state = states[p->state];
     else
       state = "???";
-    printk("%d %s %s", p->pid, state, p->name);
+    printk("%d %s %s prio %d cpu %d", p->pid, state, p->name, p->prio, p->cpu);
     printk("\n");
   }
 }
