@@ -279,6 +279,8 @@ ifeq ($(LAB),util)
 endif
 
 
+UPROGS += $U/_sandbox
+
 fs.img: mkfs/mkfs README $(UEXTRA) $(UPROGS)
 	mkfs/mkfs fs.img README $(UEXTRA) $(UPROGS)
 

@@ -105,3 +105,26 @@ sys_uptime(void)
   release(&tickslock);
   return xticks;
 }
+
+uint64
+sys_interpose(void)
+{
+  int mask;
+  char path[MAXPATH];
+
+  argint(0, &mask);
+
+  if (argstr(1, path, sizeof(path)) < 0)
+    return -1;
+
+  // 第一部分只支持 "-"，不实现路径白名单。
+  if (path[0] != '-' || path[1] != '\0')
+    return -1;
+
+  struct proc *p = myproc();
+
+  // 累加限制，不能通过再次调用 interpose(0, "-") 解除限制。
+  p->sandbox_mask |= (uint)mask;
+
+  return 0;
+}
