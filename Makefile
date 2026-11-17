@@ -279,6 +279,9 @@ ifeq ($(LAB),util)
 endif
 
 
+UPROGS += $U/_sleep $U/_primes $U/_sixfive $U/_find
+UEXTRA += user/sixfives.txt
+
 fs.img: mkfs/mkfs README $(UEXTRA) $(UPROGS)
 	mkfs/mkfs fs.img README $(UEXTRA) $(UPROGS)
 
