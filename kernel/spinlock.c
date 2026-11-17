@@ -124,29 +124,71 @@ release(struct spinlock *lk)
 static void
 read_acquire_inner(struct rwspinlock *rwlk)
 {
-  // Replace this with your implementation.
-  acquire(&rwlk->l);
+  for(;;){
+    // New readers must wait for active or pending writers.
+    while(__atomic_load_n(&rwlk->writer, __ATOMIC_SEQ_CST) != 0 ||
+          __atomic_load_n(&rwlk->waiting_writers,
+                          __ATOMIC_SEQ_CST) != 0){
+      // Spin.
+    }
+
+    // Register as a reader without taking an internal spinlock.
+    __atomic_fetch_add(&rwlk->readers, 1, __ATOMIC_SEQ_CST);
+
+    // A writer may have arrived between the first check
+    // and the reader registration.
+    if(__atomic_load_n(&rwlk->writer, __ATOMIC_SEQ_CST) == 0 &&
+       __atomic_load_n(&rwlk->waiting_writers,
+                       __ATOMIC_SEQ_CST) == 0){
+      return;
+    }
+
+    // A writer arrived: withdraw and retry.
+    __atomic_fetch_sub(&rwlk->readers, 1, __ATOMIC_SEQ_CST);
+  }
 }
 
 static void
 read_release_inner(struct rwspinlock *rwlk)
 {
-  // Replace this with your implementation.
-  release(&rwlk->l);
+  __atomic_fetch_sub(&rwlk->readers, 1, __ATOMIC_SEQ_CST);
 }
 
 static void
 write_acquire_inner(struct rwspinlock *rwlk)
 {
-  // Replace this with your implementation.
-  acquire(&rwlk->l);
+  // Announce a pending writer before competing for exclusive access.
+  __atomic_fetch_add(&rwlk->waiting_writers, 1,
+                     __ATOMIC_SEQ_CST);
+
+  for(;;){
+    uint expected = 0;
+
+    // Only one writer can change writer from 0 to 1.
+    if(__atomic_compare_exchange_n(&rwlk->writer,
+                                   &expected,
+                                   1,
+                                   0,
+                                   __ATOMIC_SEQ_CST,
+                                   __ATOMIC_SEQ_CST)){
+      break;
+    }
+  }
+
+  // This writer now owns the reservation.
+  __atomic_fetch_sub(&rwlk->waiting_writers, 1,
+                     __ATOMIC_SEQ_CST);
+
+  // Existing readers must finish before writing can begin.
+  while(__atomic_load_n(&rwlk->readers, __ATOMIC_SEQ_CST) != 0){
+    // Spin.
+  }
 }
 
 static void
 write_release_inner(struct rwspinlock *rwlk)
 {
-  // Replace this with your implementation.
-  release(&rwlk->l);
+  __atomic_store_n(&rwlk->writer, 0, __ATOMIC_SEQ_CST);
 }
 
 void
@@ -180,8 +222,10 @@ write_release(struct rwspinlock *rwlk)
 void
 initrwlock(struct rwspinlock *rwlk)
 {
-  // Replace this with your implementation.
-  initlock(&rwlk->l, "rwlk");
+  __atomic_store_n(&rwlk->readers, 0, __ATOMIC_SEQ_CST);
+  __atomic_store_n(&rwlk->writer, 0, __ATOMIC_SEQ_CST);
+  __atomic_store_n(&rwlk->waiting_writers, 0,
+                   __ATOMIC_SEQ_CST);
 }
 
 // Test rwspinlock implementation.

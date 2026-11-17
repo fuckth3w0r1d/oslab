@@ -584,6 +584,36 @@ sleep(void *chan, struct spinlock *lk)
   acquire(lk);
 }
 
+
+#ifdef LAB_LOCK
+// Sleep while holding a read lock on the condition.
+// Return with that read lock held again.
+void
+sleep_read(void *chan, struct rwspinlock *lk)
+{
+  struct proc *p = myproc();
+
+  // Protect the transition from checking the condition to sleeping.
+  acquire(&p->lock);
+
+  // The process lock now prevents a missed wakeup.
+  read_release(lk);
+
+  p->chan = chan;
+  p->state = SLEEPING;
+
+  sched();
+
+  // Execution resumes here after the process is scheduled again.
+  p->chan = 0;
+
+  // Preserve the condition-lock -> process-lock ordering.
+  release(&p->lock);
+  read_acquire(lk);
+}
+#endif
+
+
 // Wake up all processes sleeping on channel chan.
 // Caller should hold the condition lock.
 void

@@ -101,6 +101,9 @@ void            procinit(void);
 void            scheduler(void) __attribute__((noreturn));
 void            sched(void);
 void            sleep(void*, struct spinlock*);
+#ifdef LAB_LOCK
+void            sleep_read(void*, struct rwspinlock*);
+#endif
 void            userinit(void);
 int             kwait(uint64);
 void            wakeup(void*);
@@ -157,7 +160,7 @@ void            syscall();
 extern uint     ticks;
 void            trapinit(void);
 void            trapinithart(void);
-extern struct spinlock tickslock;
+extern struct rwspinlock tickslock;
 void            prepare_return(void);
 
 // uart.c
