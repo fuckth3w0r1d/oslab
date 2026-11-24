@@ -347,7 +347,7 @@ sys_open(void)
       return -1;
     }
   } else {
-    if ((ip = namei(path)) == 0) {
+    if ((ip = (omode & O_NOFOLLOW) ? namei_nofollow(path) : namei(path)) == 0) {
       end_op();
       return -1;
     }
@@ -392,6 +392,32 @@ sys_open(void)
   end_op();
 
   return fd;
+}
+
+uint64
+sys_symlink(void)
+{
+  char target[MAXPATH], path[MAXPATH];
+  struct inode *ip;
+  int n;
+
+  if (argstr(0, target, MAXPATH) < 0 || argstr(1, path, MAXPATH) < 0)
+    return -1;
+
+  begin_op();
+  if ((ip = create(path, T_SYMLINK, 0, 0)) == 0) {
+    end_op();
+    return -1;
+  }
+  n = strlen(target);
+  if (writei(ip, 0, (uint64)target, 0, n) != n) {
+    iunlockput(ip);
+    end_op();
+    return -1;
+  }
+  iunlockput(ip);
+  end_op();
+  return 0;
 }
 
 uint64

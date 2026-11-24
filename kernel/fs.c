@@ -412,7 +412,8 @@ ireclaim(int dev)
 // The content (data) associated with each inode is stored
 // in blocks on the disk. The first NDIRECT block numbers
 // are listed in ip->addrs[].  The next NINDIRECT blocks are
-// listed in block ip->addrs[NDIRECT].
+// listed in block ip->addrs[NDIRECT].  The remaining NDINDIRECT blocks
+// are reached through the double-indirect block ip->addrs[NDIRECT+1].
 
 // Return the disk block address of the nth block in inode ip.
 // If there is no such block, bmap allocates one.
@@ -454,6 +455,39 @@ bmap(struct inode *ip, uint bn)
     brelse(bp);
     return addr;
   }
+  bn -= NINDIRECT;
+
+  if (bn < NDINDIRECT) {
+    if ((addr = ip->addrs[NDIRECT + 1]) == 0) {
+      addr = balloc(ip->dev);
+      if (addr == 0)
+        return 0;
+      ip->addrs[NDIRECT + 1] = addr;
+    }
+    bp = bread(ip->dev, addr);
+    a = (uint *)bp->data;
+    if ((addr = a[bn / NINDIRECT]) == 0) {
+      addr = balloc(ip->dev);
+      if (addr == 0) {
+        brelse(bp);
+        return 0;
+      }
+      a[bn / NINDIRECT] = addr;
+      log_write(bp);
+    }
+    brelse(bp);
+    bp = bread(ip->dev, addr);
+    a = (uint *)bp->data;
+    if ((addr = a[bn % NINDIRECT]) == 0) {
+      addr = balloc(ip->dev);
+      if (addr) {
+        a[bn % NINDIRECT] = addr;
+        log_write(bp);
+      }
+    }
+    brelse(bp);
+    return addr;
+  }
 
   panic("bmap: out of range");
 }
@@ -463,9 +497,9 @@ bmap(struct inode *ip, uint bn)
 void
 itrunc(struct inode *ip)
 {
-  int i, j;
-  struct buf *bp;
-  uint *a;
+  int i, j, k;
+  struct buf *bp, *bp2;
+  uint *a, *a2;
 
   for (i = 0; i < NDIRECT; i++) {
     if (ip->addrs[i]) {
@@ -484,6 +518,25 @@ itrunc(struct inode *ip)
     brelse(bp);
     bfree(ip->dev, ip->addrs[NDIRECT]);
     ip->addrs[NDIRECT] = 0;
+  }
+
+  if (ip->addrs[NDIRECT + 1]) {
+    bp = bread(ip->dev, ip->addrs[NDIRECT + 1]);
+    a = (uint *)bp->data;
+    for (j = 0; j < NINDIRECT; j++) {
+      if (a[j] == 0)
+        continue;
+      bp2 = bread(ip->dev, a[j]);
+      a2 = (uint *)bp2->data;
+      for (k = 0; k < NINDIRECT; k++)
+        if (a2[k])
+          bfree(ip->dev, a2[k]);
+      brelse(bp2);
+      bfree(ip->dev, a[j]);
+    }
+    brelse(bp);
+    bfree(ip->dev, ip->addrs[NDIRECT + 1]);
+    ip->addrs[NDIRECT + 1] = 0;
   }
 
   ip->size = 0;
@@ -685,57 +738,92 @@ skipelem(char *path, char *name)
 }
 
 // Look up and return the inode for a path name.
-// If parent != 0, return the inode for the parent and copy the final
-// path element into name, which must have room for DIRSIZ bytes.
+// If nameiparent != 0, return the inode for the parent instead and copy
+// the final path element into name, which must have room for DIRSIZ bytes.
+// If follow != 0, symbolic links are resolved, up to MAXSYMLINK of them.
 // Must be called inside a transaction since it calls iput().
 static struct inode *
-namex(char *path, int nameiparent, char *name)
+namex(char *path, int nameiparent, int follow, char *name)
 {
   struct inode *ip, *next;
+  char target[MAXPATH];
+  int hops, last, n;
 
-  if (*path == '/')
-    ip = iget(ROOTDEV, ROOTINO);
-  else
-    ip = idup(myproc()->cwd);
+  hops = 0;
+  last = 0;
+  for (;;) {
+    if (*path == '/')
+      ip = iget(ROOTDEV, ROOTINO);
+    else
+      ip = idup(myproc()->cwd);
 
-  while ((path = skipelem(path, name)) != 0) {
-    ilock(ip);
-    if (ip->type != T_DIR) {
+    for (;;) {
+      if ((path = skipelem(path, name)) == 0) {
+        if (nameiparent) {
+          iput(ip);
+          return 0;
+        }
+        return ip;
+      }
+      last = *path == '\0';
+      ilock(ip);
+      if (ip->type != T_DIR) {
+        iunlockput(ip);
+        return 0;
+      }
+      if (ip->nlink == 0) {
+        iunlockput(ip);
+        return 0;
+      }
+      if (nameiparent && *path == '\0') {
+        // Stop one level early.
+        iunlock(ip);
+        return ip;
+      }
+      if ((next = dirlookup(ip, name, 0)) == 0) {
+        iunlockput(ip);
+        return 0;
+      }
       iunlockput(ip);
-      return 0;
-    }
-    if (ip->nlink == 0) {
+      ip = next;
+
+      ilock(ip);
+      if (ip->type != T_SYMLINK || (last && !follow)) {
+        iunlock(ip);
+        continue;
+      }
+      if (++hops > MAXSYMLINK || nameiparent) {
+        iunlockput(ip);
+        return 0;
+      }
+      memset(target, 0, sizeof(target));
+      n = readi(ip, 0, (uint64)target, 0, MAXPATH - 1);
       iunlockput(ip);
-      return 0;
+      if (n <= 0)
+        return 0;
+      path = target;
+      break;
     }
-    if (nameiparent && *path == '\0') {
-      // Stop one level early.
-      iunlock(ip);
-      return ip;
-    }
-    if ((next = dirlookup(ip, name, 0)) == 0) {
-      iunlockput(ip);
-      return 0;
-    }
-    iunlockput(ip);
-    ip = next;
   }
-  if (nameiparent) {
-    iput(ip);
-    return 0;
-  }
-  return ip;
+  return 0;
 }
 
 struct inode *
 namei(char *path)
 {
   char name[DIRSIZ];
-  return namex(path, 0, name);
+  return namex(path, 0, 1, name);
+}
+
+struct inode *
+namei_nofollow(char *path)
+{
+  char name[DIRSIZ];
+  return namex(path, 0, 0, name);
 }
 
 struct inode *
 nameiparent(char *path, char *name)
 {
-  return namex(path, 1, name);
+  return namex(path, 1, 0, name);
 }
