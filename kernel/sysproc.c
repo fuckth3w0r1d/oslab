@@ -6,6 +6,7 @@
 #include "spinlock.h"
 #include "proc.h"
 #include "vm.h"
+#include "runqueue.h"
 
 uint64
 sys_exit(void)
@@ -109,4 +110,29 @@ sys_uptime(void)
   xticks = ticks;
   release(&tickslock);
   return xticks;
+}
+
+uint64
+sys_setpriority(void)
+{
+  int level;
+  argint(0, &level);
+  return mlfq_setpriority(level);
+}
+
+uint64
+sys_getpriority(void)
+{
+  return mlfq_getpriority();
+}
+
+uint64
+sys_getrqstats(void)
+{
+  uint64 user_addr;
+  struct rq_stats snapshots[NCPU];
+  argaddr(0, &user_addr);
+  rq_snapshot(snapshots);
+  return either_copyout(1, user_addr, snapshots,
+                        sizeof(snapshots));
 }

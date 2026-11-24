@@ -5,6 +5,7 @@
 #include "spinlock.h"
 #include "proc.h"
 #include "defs.h"
+#include "runqueue.h"
 
 struct spinlock tickslock;
 uint ticks;
@@ -82,8 +83,10 @@ usertrap(void)
     kexit(-1);
 
   // give up the CPU if this is a timer interrupt.
-  if (which_dev == 2)
+  if (which_dev == 2) {
+    mlfq_on_tick();
     yield();
+  }
 
   prepare_return();
 
@@ -154,8 +157,10 @@ kerneltrap()
   }
 
   // give up the CPU if this is a timer interrupt.
-  if (which_dev == 2 && myproc() != 0)
+  if (which_dev == 2 && myproc() != 0) {
+    mlfq_on_tick();
     yield();
+  }
 
   // the yield() may have caused some traps to occur,
   // so restore trap registers for use by kernelvec.S's sepc instruction.
@@ -169,8 +174,11 @@ clockintr()
   if (cpuid() == 0) {
     acquire(&tickslock);
     ticks++;
+    uint now = ticks;
     wakeup(&ticks);
     release(&tickslock);
+    if (now % MLFQ_BOOST_TICKS == 0)
+      rq_boost_all();
   }
 
   // ask for the next timer interrupt. this also clears

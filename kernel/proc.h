@@ -101,4 +101,10 @@ struct proc {
   struct file *ofile[NOFILE];  // Open files
   struct inode *cwd;           // Current directory
   char name[16];               // Process name (debugging)
+
+  int priority;    // 0 highest, 3 lowest; protected by p->lock
+  int slice_used;  // CPU ticks used at current MLFQ level; p->lock
+  int last_cpu;    // last CPU on which this process ran; p->lock
+  int on_rq;       // membership: protected by the owning rq lock
+  int rq_cpu;      // owning queue CPU; protected by queue lock
 };

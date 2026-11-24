@@ -5,6 +5,7 @@
 #include "spinlock.h"
 #include "proc.h"
 #include "defs.h"
+#include "runqueue.h"
 
 struct cpu cpus[NCPU];
 
@@ -51,6 +52,9 @@ procinit(void)
 
   initlock(&pid_lock, "nextpid");
   initlock(&wait_lock, "wait_lock");
+
+  rq_init();
+
   for (p = proc; p < &proc[NPROC]; p++) {
     initlock(&p->lock, "proc");
     p->state = UNUSED;
@@ -125,6 +129,12 @@ found:
   p->pid = allocpid();
   p->state = USED;
 
+  p->priority = 0;
+  p->slice_used = 0;
+  p->last_cpu = 0;
+  p->rq_cpu = -1;
+  p->on_rq = 0;
+
   // Allocate a trapframe page.
   if ((p->trapframe = (struct trapframe *)kalloc()) == 0) {
     freeproc(p);
@@ -167,6 +177,16 @@ freeproc(struct proc *p)
   p->chan = 0;
   p->killed = 0;
   p->xstate = 0;
+
+  if (p->on_rq)
+    panic("freeproc: queued");
+
+  p->priority = 0;
+  p->slice_used = 0;
+  p->last_cpu = 0;
+  p->rq_cpu = -1;
+  p->on_rq = 0;
+
   p->state = UNUSED;
 }
 
@@ -226,6 +246,8 @@ userinit(void)
   p->cwd = namei("/");
 
   p->state = RUNNABLE;
+
+  rq_enqueue(0, p);
 
   release(&p->lock);
 }
@@ -299,6 +321,13 @@ kfork(void)
 
   acquire(&np->lock);
   np->state = RUNNABLE;
+
+  // 子进程进入当前 CPU 的队列
+  int cpu_id = cpuid();
+  np->last_cpu = cpu_id;
+  
+  rq_enqueue(cpu_id, np);
+
   release(&np->lock);
 
   return pid;
@@ -425,47 +454,41 @@ kwait(uint64 addr)
 //  - swtch to start running that process.
 //  - eventually that process transfers control
 //    via swtch back to the scheduler.
+/*
+Required Function 3
+*/
+
 void
 scheduler(void)
 {
-  struct proc *p;
-  struct cpu *c = mycpu();
+    struct cpu *c = mycpu();
 
-  c->proc = 0;
+    c->proc = 0;
+
   for (;;) {
-    // The most recent process to run may have had interrupts
-    // turned off; enable them to avoid a deadlock if all
-    // processes are waiting. Then turn them back off
-    // to avoid a possible race between an interrupt
-    // and wfi.
     intr_on();
     intr_off();
-
-    int found = 0;
-    for (p = proc; p < &proc[NPROC]; p++) {
-      acquire(&p->lock);
-      if (p->state == RUNNABLE) {
-        // Switch to chosen process.  It is the process's job
-        // to release its lock and then reacquire it
-        // before jumping back to us.
-        p->state = RUNNING;
-        c->proc = p;
-        swtch(&c->context, &p->context);
-
-        // Don't re-enable interrupts on release.
-        mycpu()->intena = 0;
-
-        // Process is done running for now.
-        // It should have changed its p->state before coming back.
-        c->proc = 0;
-        found = 1;
-      }
-      release(&p->lock);
-    }
-    if (found == 0) {
-      // nothing to run; stop running on this core until an interrupt.
+    int cpu = cpuid();
+    struct proc *p = rq_pop(cpu);
+    if (p == 0 && rq_steal(cpu))
+      p = rq_pop(cpu);
+    if (p == 0) {
       asm volatile("wfi");
+      continue;
     }
+    acquire(&p->lock);
+    if (p->state != RUNNABLE || p->on_rq)
+      panic("scheduler: not runnable");
+    p->last_cpu = cpu;
+    p->state = RUNNING;
+    c->proc = p;
+    rq_account_dispatch(cpu);
+    swtch(&c->context, &p->context);
+    mycpu()->intena = 0;
+    c->proc = 0;
+    if (p->state == RUNNABLE)
+      rq_enqueue(cpu, p);
+    release(&p->lock);
   }
 }
 
@@ -476,10 +499,14 @@ scheduler(void)
 // be proc->intena and proc->noff, but that would
 // break in the few places where a lock is held but
 // there's no process.
+
+/*
+Required Function 2
+*/
 void
 sched(void)
 {
-  int intena;
+  int intena; //保存中断状态
   struct proc *p = myproc();
 
   if (!holding(&p->lock))
@@ -497,6 +524,9 @@ sched(void)
 }
 
 // Give up the CPU for one scheduling round.
+/*
+Required Function 1
+*/
 void
 yield(void)
 {
@@ -566,6 +596,7 @@ sleep(void)
 
   acquire(&p->lock);
   if (p->chan != 0) {
+    p->slice_used = 0;
     p->state = SLEEPING;
     sched();
   }
@@ -589,6 +620,14 @@ wakeup(void *chan)
       // go to sleep, also set it back to RUNNING.
       if (p->state == SLEEPING) {
         p->state = RUNNABLE;
+
+        // 尽量保持 CPU 亲和性
+        int cpu_id = p->last_cpu;
+
+        if (cpu_id < 0 || cpu_id >= NCPU)
+            cpu_id = 0;
+
+        rq_enqueue(cpu_id, p);
       }
     }
     release(&p->lock);
@@ -610,6 +649,13 @@ kkill(int pid)
       if (p->state == SLEEPING) {
         // Wake process from sleep().
         p->state = RUNNABLE;
+
+        int cpu_id = p->last_cpu;
+
+        if (cpu_id < 0 || cpu_id >= NCPU)
+            cpu_id = 0;
+
+        rq_enqueue(cpu_id, p);
       }
       release(&p->lock);
       return 0;
@@ -698,4 +744,45 @@ procdump(void)
     printk("%d %s %s", p->pid, state, p->name);
     printk("\n");
   }
+}
+
+static const int mlfq_quantum[NQUEUE] = {1, 2, 4, 8};
+
+void
+mlfq_on_tick(void)
+{
+  struct proc *p = myproc();
+  if (!p) return;
+  acquire(&p->lock);
+  if (p->state == RUNNING) {
+    p->slice_used++;
+    if (p->slice_used >= mlfq_quantum[p->priority]) {
+      p->slice_used = 0;
+      if (p->priority < NQUEUE - 1)
+        p->priority++;
+    }
+  }
+  release(&p->lock);
+}
+
+int
+mlfq_setpriority(int level)
+{
+  if (level < 0 || level >= NQUEUE) return -1;
+  struct proc *p = myproc();
+  acquire(&p->lock);
+  p->priority = level;
+  p->slice_used = 0;
+  release(&p->lock);
+  return 0;
+}
+
+int
+mlfq_getpriority(void)
+{
+  struct proc *p = myproc();
+  acquire(&p->lock);
+  int level = p->priority;
+  release(&p->lock);
+  return level;
 }

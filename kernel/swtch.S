@@ -21,6 +21,7 @@ swtch:
         sd s9, 88(a0)
         sd s10, 96(a0)
         sd s11, 104(a0)
+        #store old registers
 
         ld ra, 0(a1)
         ld sp, 8(a1)
@@ -36,6 +37,8 @@ swtch:
         ld s9, 88(a1)
         ld s10, 96(a1)
         ld s11, 104(a1)
+        #load new registers
+
         
         ret
 
