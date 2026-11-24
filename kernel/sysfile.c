@@ -243,7 +243,8 @@ bad:
 }
 
 static struct inode*
-create(char *path, short type, short major, short minor)
+create_impl(char *path, short type, short major, short minor,
+            const char *target)
 {
   struct inode *ip, *dp;
   char name[DIRSIZ];
@@ -279,6 +280,18 @@ create(char *path, short type, short major, short minor)
       goto fail;
   }
 
+    // Initialize the symbolic link before publishing its directory entry.
+  if(type == T_SYMLINK){
+    if(target == 0)
+      goto fail;
+
+    int len = strlen(target) + 1;
+
+    if(len > MAXPATH ||
+       writei(ip, 0, (uint64)target, 0, len) != len)
+      goto fail;
+  }
+
   if(dirlink(dp, name, ip->inum) < 0)
     goto fail;
 
@@ -301,6 +314,39 @@ create(char *path, short type, short major, short minor)
   return 0;
 }
 
+static struct inode*
+create(char *path, short type, short major, short minor)
+{
+  return create_impl(path, type, major, minor, 0);
+}
+
+uint64
+sys_symlink(void)
+{
+  char target[MAXPATH];
+  char path[MAXPATH];
+  struct inode *ip;
+
+  if(argstr(0, target, sizeof(target)) < 0 ||
+     argstr(1, path, sizeof(path)) < 0)
+    return -1;
+
+  begin_op();
+
+  ip = create_impl(path, T_SYMLINK, 0, 0, target);
+
+  if(ip == 0){
+    end_op();
+    return -1;
+  }
+
+  // create_impl() returns a referenced and locked inode.
+  iunlockput(ip);
+  end_op();
+
+  return 0;
+}
+
 uint64
 sys_open(void)
 {
@@ -309,6 +355,7 @@ sys_open(void)
   struct file *f;
   struct inode *ip;
   int n;
+  int depth = 0;
 
   argint(1, &omode);
   if((n = argstr(0, path, MAXPATH)) < 0)
@@ -328,11 +375,57 @@ sys_open(void)
       return -1;
     }
     ilock(ip);
-    if(ip->type == T_DIR && omode != O_RDONLY){
+
+  }
+
+    // Follow symbolic links unless the caller asks for the link itself.
+  while(ip->type == T_SYMLINK && !(omode & O_NOFOLLOW)){
+    if(depth >= 10){
       iunlockput(ip);
       end_op();
       return -1;
     }
+    depth++;
+
+    // Our link format stores a path including its terminating NUL.
+    if(ip->size == 0 || ip->size > sizeof(path)){
+      iunlockput(ip);
+      end_op();
+      return -1;
+    }
+
+    int len = ip->size;
+
+    if(readi(ip, 0, (uint64)path, 0, len) != len){
+      iunlockput(ip);
+      end_op();
+      return -1;
+    }
+
+    if(path[len - 1] != '\0'){
+      iunlockput(ip);
+      end_op();
+      return -1;
+    }
+
+    // Release the current inode before looking up the next one.
+    iunlockput(ip);
+
+    ip = namei(path);
+    if(ip == 0){
+      end_op();
+      return -1;
+    }
+
+    ilock(ip);
+  }
+
+  // Check the final inode after following any symbolic links.
+  if(ip->type == T_DIR &&
+     (omode & ~O_NOFOLLOW) != O_RDONLY){
+    iunlockput(ip);
+    end_op();
+    return -1;
   }
 
   if(ip->type == T_DEVICE && (ip->major < 0 || ip->major >= NDEV)){

@@ -5,11 +5,21 @@
 int
 main(int argc, char *argv[])
 {
-  if(argc != 3){
-    fprintf(2, "Usage: ln old new\n");
+  int ret;
+
+  if(argc == 4 && strcmp(argv[1], "-s") == 0){
+    ret = symlink(argv[2], argv[3]);
+  } else if(argc == 3){
+    ret = link(argv[1], argv[2]);
+  } else {
+    fprintf(2, "usage: ln [-s] target linkpath\n");
     exit(1);
   }
-  if(link(argv[1], argv[2]) < 0)
-    fprintf(2, "link %s %s: failed\n", argv[1], argv[2]);
+
+  if(ret < 0){
+    fprintf(2, "ln: failed\n");
+    exit(1);
+  }
+
   exit(0);
 }
